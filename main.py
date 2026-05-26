@@ -615,6 +615,12 @@ class ImageGenerationPlugin(Star):
         else:
             logger.error("[ImageGen] 适配器配置加载失败，插件未初始化")
 
+        logger.info(
+            "[ImageGen] 开关状态: "
+            f"enable_llm_tool={self.config_manager.enable_llm_tool}, "
+            f"safety_audit.enabled={self.config_manager.safety_audit_settings.enabled}"
+        )
+
         # 注册 LLM 工具
         if self.config_manager.enable_llm_tool and self.generator:
             self._register_or_refresh_llm_tool()

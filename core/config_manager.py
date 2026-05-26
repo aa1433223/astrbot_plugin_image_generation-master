@@ -135,7 +135,9 @@ class ConfigManager:
         safety_cfg = self._config.get("safety_audit", {})
         api_providers_raw = self._config.get("api_providers", [])
 
-        self._plugin_config.enable_llm_tool = self._config.get("enable_llm_tool", True)
+        self._plugin_config.enable_llm_tool = self._to_bool(
+            self._config.get("enable_llm_tool", True), default=True
+        )
         self._plugin_config.llm_provider_id = str(
             self._config.get("llm_provider_id", "")
         ).strip()
