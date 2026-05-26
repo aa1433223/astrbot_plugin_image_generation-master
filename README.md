@@ -1,0 +1,2 @@
+# astrbot_plugin_image_generation-master
+astr生图插件
