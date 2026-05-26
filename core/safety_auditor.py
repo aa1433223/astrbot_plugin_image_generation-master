@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+import time
 
 from astrbot.api import logger
 from astrbot.api.star import Context
@@ -15,6 +17,7 @@ class SafetyAuditor:
     """Audits prompts and generated images."""
 
     PROMPT_PLACEHOLDER = "{prompt}"
+    MODEL_AUDIT_TIMEOUT_SECONDS = 30
 
     def __init__(self, context: Context, config_manager: ConfigManager):
         self._context = context
@@ -135,15 +138,28 @@ class SafetyAuditor:
             logger.warning(f"[ImageGen] {msg}")
             return False, msg
 
+        start_time = time.time()
         try:
-            response = await provider.text_chat(
-                prompt=review_prompt,
-                image_urls=image_urls or [],
-                persist=False,
+            response = await asyncio.wait_for(
+                provider.text_chat(
+                    prompt=review_prompt,
+                    image_urls=image_urls or [],
+                    persist=False,
+                ),
+                timeout=self.MODEL_AUDIT_TIMEOUT_SECONDS,
             )
+            duration = time.time() - start_time
+            logger.info(f"[ImageGen] 审核模型调用完成，耗时: {duration:.2f}s")
             completion_text = (response.completion_text or "").strip()
             decision, reason = self._parse_audit_response(completion_text)
             return decision, reason
+        except TimeoutError:
+            msg = (
+                "安全审核异常：模型调用超时 "
+                f"({self.MODEL_AUDIT_TIMEOUT_SECONDS}s)"
+            )
+            logger.warning(f"[ImageGen] {msg}")
+            return False, msg
         except Exception as exc:
             msg = f"安全审核异常：模型调用失败 - {str(exc)[:180]}"
             logger.warning(f"[ImageGen] {msg}")

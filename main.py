@@ -1042,8 +1042,16 @@ class ImageGenerationPlugin(Star):
             yield event.plain_result("❌ 请提供图片生成的提示词或预设名称！")
             return
 
+        prompt_audit_start = time.time()
         prompt_allowed, prompt_reason = await self.safety_auditor.audit_prompt(
             prompt, event.unified_msg_origin
+        )
+        prompt_audit_duration = time.time() - prompt_audit_start
+        logger.info(
+            f"[ImageGen] 提示词审核阶段耗时: {prompt_audit_duration:.2f}s"
+        )
+        yield event.plain_result(
+            f"[诊断] 提示词审核耗时: {prompt_audit_duration:.2f}s"
         )
         if not prompt_allowed:
             yield event.plain_result(f"❌ 提示词审核未通过: {prompt_reason}")
@@ -1052,6 +1060,7 @@ class ImageGenerationPlugin(Star):
         # 获取参考图
         images_data = []
         reference_cache_paths: list[str] = []
+        fetch_images_start = time.time()
         if (
             self.generator
             and self.generator.adapter
@@ -1065,6 +1074,13 @@ class ImageGenerationPlugin(Star):
             )
             images_data = fetched_images.images
             reference_cache_paths = fetched_images.cache_paths
+            fetch_images_duration = time.time() - fetch_images_start
+            logger.info(
+                f"[ImageGen] 参考图提取阶段耗时: {fetch_images_duration:.2f}s"
+            )
+            yield event.plain_result(
+                f"[诊断] 参考图提取耗时: {fetch_images_duration:.2f}s"
+            )
             if fetched_images.has_candidates and not images_data:
                 logger.warning(
                     f"[ImageGen] 参考图候选 {fetched_images.candidate_count} 个，"
