@@ -1,0 +1,4 @@
+__pycache__/
+core/__pycache__/
+adapter/__pycache__/
+dev/

@@ -1,0 +1,7 @@
+name: noram_image_generation
+display_name: 通用生图
+desc: 通用图像生成插件（noram 本地签名版），支持多种图像生成模型和 LLM 工具调用
+version: v1.0.3
+author: Railgun19457 / noram-local
+repo: ""
+astrbot_version: ">=4.10.4"
