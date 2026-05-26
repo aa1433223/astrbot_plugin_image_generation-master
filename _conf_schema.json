@@ -519,6 +519,12 @@
         "hint": "生图成功后,发送消息展示所使用的模型名称",
         "type": "bool",
         "default": false
+      },
+      "show_diagnostic_timing": {
+        "description": "显示诊断耗时",
+        "hint": "在会话中额外显示提示词审核耗时与参考图提取耗时，用于排查卡顿",
+        "type": "bool",
+        "default": false
       }
     }
   },

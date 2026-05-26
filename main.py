@@ -1050,9 +1050,10 @@ class ImageGenerationPlugin(Star):
         logger.info(
             f"[ImageGen] 提示词审核阶段耗时: {prompt_audit_duration:.2f}s"
         )
-        yield event.plain_result(
-            f"[诊断] 提示词审核耗时: {prompt_audit_duration:.2f}s"
-        )
+        if self.config_manager.show_diagnostic_timing:
+            yield event.plain_result(
+                f"[诊断] 提示词审核耗时: {prompt_audit_duration:.2f}s"
+            )
         if not prompt_allowed:
             yield event.plain_result(f"❌ 提示词审核未通过: {prompt_reason}")
             return
@@ -1078,9 +1079,10 @@ class ImageGenerationPlugin(Star):
             logger.info(
                 f"[ImageGen] 参考图提取阶段耗时: {fetch_images_duration:.2f}s"
             )
-            yield event.plain_result(
-                f"[诊断] 参考图提取耗时: {fetch_images_duration:.2f}s"
-            )
+            if self.config_manager.show_diagnostic_timing:
+                yield event.plain_result(
+                    f"[诊断] 参考图提取耗时: {fetch_images_duration:.2f}s"
+                )
             if fetched_images.has_candidates and not images_data:
                 logger.warning(
                     f"[ImageGen] 参考图候选 {fetched_images.candidate_count} 个，"

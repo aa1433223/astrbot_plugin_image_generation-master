@@ -45,6 +45,7 @@ class GenerationSettings:
     max_concurrent_tasks: int = 3
     show_generation_info: bool = False
     show_model_info: bool = False
+    show_diagnostic_timing: bool = False
 
 
 @dataclass
@@ -288,8 +289,15 @@ class ConfigManager:
             i2i_default_aspect_ratio=gen_cfg.get("i2i_default_aspect_ratio", "自动"),
             i2i_default_resolution=gen_cfg.get("i2i_default_resolution", "1K"),
             max_concurrent_tasks=max(1, gen_cfg.get("max_concurrent_tasks", 3)),
-            show_generation_info=gen_cfg.get("show_generation_info", False),
-            show_model_info=gen_cfg.get("show_model_info", False),
+            show_generation_info=self._to_bool(
+                gen_cfg.get("show_generation_info", False), default=False
+            ),
+            show_model_info=self._to_bool(
+                gen_cfg.get("show_model_info", False), default=False
+            ),
+            show_diagnostic_timing=self._to_bool(
+                gen_cfg.get("show_diagnostic_timing", False), default=False
+            ),
         )
 
         # 安全审核设置
@@ -484,6 +492,11 @@ class ConfigManager:
     def show_model_info(self) -> bool:
         """是否显示模型信息。"""
         return self._plugin_config.generation_settings.show_model_info
+
+    @property
+    def show_diagnostic_timing(self) -> bool:
+        """是否在会话中显示诊断耗时。"""
+        return self._plugin_config.generation_settings.show_diagnostic_timing
 
     @property
     def usage_settings(self) -> UsageSettings:
