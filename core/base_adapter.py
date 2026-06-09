@@ -126,6 +126,12 @@ class BaseImageAdapter(abc.ABC):
             return ""
         return self.api_keys[self.current_key_index % len(self.api_keys)]
 
+    def _get_request_api_key(self, request: GenerationRequest | None = None) -> str:
+        """获取本次请求使用的 API Key，允许调用方按用户覆盖。"""
+        if request and request.api_key_override:
+            return request.api_key_override
+        return self._get_current_api_key()
+
     def _get_masked_api_key(self) -> str:
         """获取脱敏后的当前 API Key，用于日志输出。"""
         return mask_sensitive(self._get_current_api_key())
@@ -329,7 +335,7 @@ class BaseImageAdapter(abc.ABC):
         子类应重写 ``_generate_once()`` 方法来实现具体的生成逻辑。
         如需在生成前进行预处理验证，可重写 ``_pre_generate()`` 方法。
         """
-        if not self.api_keys:
+        if not self.api_keys and not request.api_key_override:
             return GenerationResult(images=None, error="未配置 API Key")
 
         # 预处理检查（子类可重写）
@@ -372,6 +378,11 @@ class BaseImageAdapter(abc.ABC):
 
                 # 鉴权/限流：轮换 Key 可能有效
                 if error_cat in _KEY_ROTATION_CATEGORIES:
+                    if current_request.api_key_override:
+                        logger.warning(
+                            f"{prefix} 使用个人 Key 时发生 {error_cat.value}，停止重试"
+                        )
+                        return GenerationResult(images=None, error=last_error)
                     if len(self.api_keys) > 1:
                         self._rotate_api_key()
                         continue

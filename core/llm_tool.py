@@ -103,9 +103,20 @@ class ImageGenerationTool(FunctionTool[AstrAgentContext]):
             )
             return "❌ 无法获取当前消息上下文"
 
+        api_key_override, key_error = plugin.resolve_user_api_key_for_event(event)
+        if key_error:
+            logger.warning(
+                f"[ImageGen] 工具调用个人 Key 校验失败: {key_error} "
+                f"(用户: {event.unified_msg_origin})"
+            )
+            return f"❌ {key_error}"
+
         if (
             not plugin.config_manager.adapter_config
-            or not plugin.config_manager.adapter_config.api_keys
+            or (
+                not plugin.config_manager.adapter_config.api_keys
+                and not api_key_override
+            )
         ):
             logger.warning(
                 f"[ImageGen] 工具调用失败: 未配置 API Key (用户: {event.unified_msg_origin})"
@@ -230,6 +241,7 @@ class ImageGenerationTool(FunctionTool[AstrAgentContext]):
                     or plugin.config_manager.default_resolution,
                     task_id=task_id,
                     reserved_usage=True,
+                    api_key_override=api_key_override,
                 )
             finally:
                 if not generation_started:

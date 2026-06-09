@@ -12,6 +12,32 @@
     "default": "",
     "_special": "select_provider"
   },
+  "key_distributor": {
+    "description": "NewAPI Key 分发插件接入",
+    "hint": "开启后，OpenAI/NewAPI 生图会按 QQ 从 Key 分发插件读取用户自己的 Key。",
+    "collapsed": true,
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用个人 Key 生图",
+        "hint": "开启后 /画图、/生成图 和 LLM 生图工具会优先使用当前 QQ 在 Key 分发插件里的 active key。",
+        "type": "bool",
+        "default": false
+      },
+      "data_path": {
+        "description": "Key 分发数据文件路径",
+        "hint": "留空时默认读取同级插件数据目录下 astrbot_plugin_newapi_key_distributor/newapi_key_distributor.json。若实际路径不同，请填写绝对路径。",
+        "type": "string",
+        "default": ""
+      },
+      "require_key": {
+        "description": "必须拥有个人 Key",
+        "hint": "开启后，没有 active 明文 Key 的用户不能生图；关闭后找不到个人 Key 时回退使用生图插件配置的公共 api_keys。",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
   "api_providers": {
     "type": "template_list",
     "description": "API 供应商配置",

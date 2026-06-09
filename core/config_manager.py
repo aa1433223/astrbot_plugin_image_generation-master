@@ -85,6 +85,15 @@ class SafetyAuditSettings:
 
 
 @dataclass
+class KeyDistributorSettings:
+    """NewAPI Key 分发插件接入设置。"""
+
+    enabled: bool = False
+    data_path: str = ""
+    require_key: bool = True
+
+
+@dataclass
 class PluginConfig:
     """完整的插件配置。"""
 
@@ -98,6 +107,9 @@ class PluginConfig:
     presets: dict[str, Any] = field(default_factory=dict)
     enable_llm_tool: bool = True
     llm_provider_id: str = ""
+    key_distributor_settings: KeyDistributorSettings = field(
+        default_factory=KeyDistributorSettings
+    )
 
 
 class ConfigManager:
@@ -134,6 +146,9 @@ class ConfigManager:
         user_limits_cfg = self._config.get("user_limits", {})
         cache_cfg = self._config.get("cache", {})
         safety_cfg = self._config.get("safety_audit", {})
+        key_distributor_cfg = self._config.get("key_distributor", {})
+        if not isinstance(key_distributor_cfg, dict):
+            key_distributor_cfg = {}
         api_providers_raw = self._config.get("api_providers", [])
 
         self._plugin_config.enable_llm_tool = self._to_bool(
@@ -142,6 +157,24 @@ class ConfigManager:
         self._plugin_config.llm_provider_id = str(
             self._config.get("llm_provider_id", "")
         ).strip()
+        default_key_data_path = ""
+        if self._data_dir is not None:
+            default_key_data_path = str(
+                self._data_dir.parent
+                / "astrbot_plugin_newapi_key_distributor"
+                / "newapi_key_distributor.json"
+            )
+        self._plugin_config.key_distributor_settings = KeyDistributorSettings(
+            enabled=self._to_bool(
+                key_distributor_cfg.get("enabled", False), default=False
+            ),
+            data_path=str(
+                key_distributor_cfg.get("data_path") or default_key_data_path
+            ).strip(),
+            require_key=self._to_bool(
+                key_distributor_cfg.get("require_key", True), default=True
+            ),
+        )
 
         # 1. 收集所有供应商配置
         all_provider_configs: list[AdapterConfig] = []
@@ -517,6 +550,11 @@ class ConfigManager:
     def llm_provider_id(self) -> str:
         """独立 LLM 提供商 ID。"""
         return self._plugin_config.llm_provider_id
+
+    @property
+    def key_distributor_settings(self) -> KeyDistributorSettings:
+        """NewAPI Key 分发插件接入设置。"""
+        return self._plugin_config.key_distributor_settings
 
     # ---------------------- 供应商查询方法 ----------------------
     def has_provider_type(self, adapter_type: AdapterType) -> bool:

@@ -140,6 +140,32 @@ OpenAI/NewAPI 只要请求里有参考图，默认都会走 multipart，把图�
 | --- | --- | --- |
 | `enable_llm_tool` | `true` | 是否允许 LLM 自动调用生图工具 |
 
+### NewAPI Key 分发接入
+
+如果同时安装了 `astrbot_plugin_newapi_key_distributor`，可以让每个 QQ 用户使用自己的 NewAPI Key 生图，而不是共用本插件 `api_keys`。
+
+Key 分发插件必须开启：
+
+```text
+store_plain_keys = true
+```
+
+本插件开启：
+
+```text
+key_distributor.enabled = true
+key_distributor.require_key = true
+key_distributor.data_path =
+```
+
+`data_path` 留空时会默认读取同级插件数据目录下：
+
+```text
+astrbot_plugin_newapi_key_distributor/newapi_key_distributor.json
+```
+
+启用后，`/画图`、`/生成图` 和 LLM 生图工具会按当前 QQ 查找 active 且保存了明文 `key_plain` 的 Key，并仅在本次 OpenAI/NewAPI 请求里使用该用户自己的 Key。当前只对 `openai` 适配器生效。
+
 ### API 供应商
 
 每个供应商包含：

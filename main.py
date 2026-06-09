@@ -23,10 +23,17 @@ from astrbot.core.star.star_tools import StarTools
 from .core.config_manager import ConfigManager
 from .core.generator import ImageGenerator
 from .core.image_processor import ImageProcessor
+from .core.key_distributor import KeyDistributorResolver
 from .core.llm_tool import ImageGenerationTool, adjust_tool_parameters
 from .core.safety_auditor import SafetyAuditor
 from .core.task_manager import TaskManager
-from .core.types import ErrorCategory, GenerationRequest, ImageCapability, ImageData
+from .core.types import (
+    AdapterType,
+    ErrorCategory,
+    GenerationRequest,
+    ImageCapability,
+    ImageData,
+)
 from .core.usage_manager import UsageManager
 from .core.utils import mask_sensitive, validate_aspect_ratio, validate_resolution
 
@@ -578,6 +585,9 @@ class ImageGenerationPlugin(Star):
 
         # 初始化配置管理器
         self.config_manager = ConfigManager(config, data_dir=self.data_dir)
+        self.key_resolver = KeyDistributorResolver(
+            self.config_manager.key_distributor_settings
+        )
 
         # 初始化使用数据管理器
         self.usage_manager = UsageManager(
@@ -620,7 +630,8 @@ class ImageGenerationPlugin(Star):
         logger.info(
             "[ImageGen] 开关状态: "
             f"enable_llm_tool={self.config_manager.enable_llm_tool}, "
-            f"safety_audit.enabled={self.config_manager.safety_audit_settings.enabled}"
+            f"safety_audit.enabled={self.config_manager.safety_audit_settings.enabled}, "
+            f"key_distributor.enabled={self.config_manager.key_distributor_settings.enabled}"
         )
 
         # 注册 LLM 工具
@@ -701,6 +712,53 @@ class ImageGenerationPlugin(Star):
             run_immediately=False,  # 启动任务已处理，无需重复执行
         )
         logger.info("[ImageGen] 已配置即梦2API自动领积分任务（启动时+每日）")
+
+    def _sender_id(self, event: AstrMessageEvent) -> str:
+        get_sender_id = getattr(event, "get_sender_id", None)
+        if callable(get_sender_id):
+            try:
+                value = get_sender_id()
+                if value:
+                    return str(value)
+            except Exception:
+                pass
+
+        message_obj = getattr(event, "message_obj", None)
+        sender = getattr(message_obj, "sender", None)
+        for obj in (sender, message_obj, event):
+            if not obj:
+                continue
+            for attr in ("user_id", "sender_id", "qq"):
+                value = getattr(obj, attr, None)
+                if value:
+                    return str(value)
+        return ""
+
+    def resolve_user_api_key_for_event(
+        self,
+        event: AstrMessageEvent,
+    ) -> tuple[str | None, str | None]:
+        """Resolve per-user NewAPI key for the current generation request."""
+        settings = self.config_manager.key_distributor_settings
+        if not settings.enabled:
+            return None, None
+
+        if (
+            self.config_manager.adapter_config
+            and self.config_manager.adapter_config.type != AdapterType.OPENAI
+        ):
+            message = "个人 Key 生图目前仅支持 OpenAI/NewAPI 生图适配器。"
+            return (None, message) if settings.require_key else (None, None)
+
+        qq_id = self._sender_id(event)
+        result = self.key_resolver.resolve(qq_id)
+        if result.api_key:
+            logger.info(
+                f"[ImageGen] 已为用户 {mask_sensitive(qq_id)} "
+                f"启用个人 NewAPI Key: {result.key_id}"
+            )
+            return result.api_key, None
+        return (None, result.message) if settings.require_key else (None, None)
 
     def _claim_command_event(self, event: AstrMessageEvent, intent: str) -> bool:
         """同一条指令只处理一次，避免兜底监听和标准 command 双触发。"""
@@ -794,6 +852,7 @@ class ImageGenerationPlugin(Star):
         resolution: str = "1K",
         task_id: str | None = None,
         reserved_usage: bool = False,
+        api_key_override: str | None = None,
     ) -> None:
         """异步生成图片并发送。"""
         reservation_transferred = False
@@ -843,6 +902,7 @@ class ImageGenerationPlugin(Star):
                 await self._do_generate_and_send(
                     prompt, unified_msg_origin, images, final_ar, final_res, task_id,
                     reserved_usage=reserved_usage,
+                    api_key_override=api_key_override,
                 )
                 return
 
@@ -851,6 +911,7 @@ class ImageGenerationPlugin(Star):
                 await self._do_generate_and_send(
                     prompt, unified_msg_origin, images, final_ar, final_res, task_id,
                     reserved_usage=reserved_usage,
+                    api_key_override=api_key_override,
                 )
         finally:
             if reserved_usage and not reservation_transferred:
@@ -866,6 +927,7 @@ class ImageGenerationPlugin(Star):
         task_id: str,
         *,
         reserved_usage: bool = False,
+        api_key_override: str | None = None,
     ) -> None:
         """执行生成逻辑并发送结果。"""
         start_time = time.time()
@@ -881,6 +943,7 @@ class ImageGenerationPlugin(Star):
                     aspect_ratio=aspect_ratio,
                     resolution=resolution,
                     task_id=task_id,
+                    api_key_override=api_key_override,
                 )
             )
             end_time = time.time()
@@ -1034,6 +1097,11 @@ class ImageGenerationPlugin(Star):
     ):
         """处理生图逻辑，供标准 command 和被动监听共用。"""
         user_id = event.unified_msg_origin
+
+        api_key_override, key_error = self.resolve_user_api_key_for_event(event)
+        if key_error:
+            yield event.plain_result(f"❌ {key_error}")
+            return
 
         reservation_result = self.usage_manager.reserve_usage(user_id)
         if reservation_result is not True:
@@ -1198,6 +1266,7 @@ class ImageGenerationPlugin(Star):
                 resolution=resolution,
                 task_id=task_id,
                 reserved_usage=True,
+                api_key_override=api_key_override,
             )
         )
 

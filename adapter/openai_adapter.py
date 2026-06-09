@@ -1025,7 +1025,7 @@ class OpenAIAdapter(BaseImageAdapter):
         use_edit: bool,
     ) -> tuple[dict[str, Any] | None, str | None]:
         base = self.base_url.rstrip("/") if self.base_url else "https://api.openai.com"
-        headers = {"Authorization": f"Bearer {self._get_current_api_key()}"}
+        headers = {"Authorization": f"Bearer {self._get_request_api_key(request)}"}
         prefix = self._get_log_prefix(request.task_id)
         async_wait = self._should_use_newapi_async()
         has_reference_images = self._should_force_image_to_image(request)
@@ -1120,7 +1120,7 @@ class OpenAIAdapter(BaseImageAdapter):
         url = f"{base}/v1/images/tasks/{task_id}"
         prefix = self._get_log_prefix(request.task_id)
         start_time = time.time()
-        headers = {"Authorization": f"Bearer {self._get_current_api_key()}"}
+        headers = {"Authorization": f"Bearer {self._get_request_api_key(request)}"}
         poll_timeout = self._get_poll_timeout(request)
         max_poll_seconds = min(poll_timeout.total or 600, 600)
 

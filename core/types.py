@@ -83,6 +83,7 @@ class GenerationRequest:
     aspect_ratio: str | None = None
     resolution: str | None = None
     task_id: str | None = None
+    api_key_override: str | None = None
 
 
 @dataclass

@@ -59,6 +59,7 @@ class ImageGenerator:
             aspect_ratio=request.aspect_ratio,
             resolution=request.resolution,
             task_id=request.task_id,
+            api_key_override=request.api_key_override,
         )
 
         try:
