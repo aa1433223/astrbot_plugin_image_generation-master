@@ -103,15 +103,6 @@ class ImageGenerationTool(FunctionTool[AstrAgentContext]):
             )
             return "❌ 无法获取当前消息上下文"
 
-        # 检查频率限制和每日限制
-        check_result = plugin.usage_manager.check_rate_limit(event.unified_msg_origin)
-        if isinstance(check_result, str):
-            if check_result:
-                logger.warning(
-                    f"[ImageGen] 工具调用触发限制: {check_result} (用户: {event.unified_msg_origin})"
-                )
-            return check_result
-
         if (
             not plugin.config_manager.adapter_config
             or not plugin.config_manager.adapter_config.api_keys
@@ -121,10 +112,20 @@ class ImageGenerationTool(FunctionTool[AstrAgentContext]):
             )
             return "❌ 未配置 API Key，无法生成图片"
 
+        reservation_result = plugin.usage_manager.reserve_usage(event.unified_msg_origin)
+        if reservation_result is not True:
+            if isinstance(reservation_result, str) and reservation_result:
+                logger.warning(
+                    f"[ImageGen] 工具调用触发限制: {reservation_result} "
+                    f"(用户: {event.unified_msg_origin})"
+                )
+            return reservation_result
+
         prompt_allowed, prompt_reason = await plugin.safety_auditor.audit_prompt(
             prompt, event.unified_msg_origin
         )
         if not prompt_allowed:
+            plugin.usage_manager.release_usage_reservation(event.unified_msg_origin)
             return f"❌ 提示词审核未通过: {prompt_reason}"
 
         # 工具调用同样支持获取上下文参考图（消息/引用/头像）
@@ -148,6 +149,9 @@ class ImageGenerationTool(FunctionTool[AstrAgentContext]):
                     logger.warning(
                         f"[ImageGen] 工具调用检测到参考图候选 {fetched_images.candidate_count} 个，"
                         "但全部缓存失败，已取消图生图任务"
+                    )
+                    plugin.usage_manager.release_usage_reservation(
+                        event.unified_msg_origin
                     )
                     return "❌ 参考图下载失败，已取消生图任务。请重新发送图片后再试。"
 
@@ -190,9 +194,13 @@ class ImageGenerationTool(FunctionTool[AstrAgentContext]):
                             f"[ImageGen] 工具调用头像参考图候选 {avatar_candidate_count} 个，"
                             "但全部缓存失败，已取消图生图任务"
                         )
+                        plugin.usage_manager.release_usage_reservation(
+                            event.unified_msg_origin
+                        )
                         return "❌ 参考图下载失败，已取消生图任务。请重新发送图片后再试。"
         except Exception as e:
             logger.error(f"[ImageGen] 处理参考图失败: {e}", exc_info=True)
+            plugin.usage_manager.release_usage_reservation(event.unified_msg_origin)
             return "❌ 参考图处理失败，已取消生图任务。请重新发送图片后再试。"
 
         # 生成任务 ID
@@ -208,17 +216,26 @@ class ImageGenerationTool(FunctionTool[AstrAgentContext]):
         # 创建后台任务进行生图
         # 添加延迟，让 LLM 有足够时间先发送回复消息，避免图片先于文字到达
         async def _delayed_generate() -> None:
-            await asyncio.sleep(3)
-            await plugin._generate_and_send_image_async(
-                prompt=prompt,
-                images_data=images_data or None,
-                unified_msg_origin=event.unified_msg_origin,
-                aspect_ratio=kwargs.get("aspect_ratio")
-                or plugin.config_manager.default_aspect_ratio,
-                resolution=kwargs.get("resolution")
-                or plugin.config_manager.default_resolution,
-                task_id=task_id,
-            )
+            generation_started = False
+            try:
+                await asyncio.sleep(3)
+                generation_started = True
+                await plugin._generate_and_send_image_async(
+                    prompt=prompt,
+                    images_data=images_data or None,
+                    unified_msg_origin=event.unified_msg_origin,
+                    aspect_ratio=kwargs.get("aspect_ratio")
+                    or plugin.config_manager.default_aspect_ratio,
+                    resolution=kwargs.get("resolution")
+                    or plugin.config_manager.default_resolution,
+                    task_id=task_id,
+                    reserved_usage=True,
+                )
+            finally:
+                if not generation_started:
+                    plugin.usage_manager.release_usage_reservation(
+                        event.unified_msg_origin
+                    )
 
         plugin.create_background_task(_delayed_generate())
 

@@ -26,6 +26,7 @@ class UsageManager:
         self._settings = settings
         self._usage_file = os.path.join(data_dir, "usage.json")
         self._usage_data: dict[str, dict[str, int]] = {}  # {date: {user_id: count}}
+        self._pending_usage_data: dict[str, dict[str, int]] = {}
         self._user_request_timestamps: dict[str, float] = {}  # 用于频率限制
         self._load_usage_data()
 
@@ -82,10 +83,18 @@ class UsageManager:
             - True: 检查通过
             - str: 错误消息
         """
-        # 1. 检查频率限制
         if self.is_session_blocked(user_id):
             return self._settings.blacklist_block_message
 
+        # 先检查每日限制，避免额度已满的请求刷新频率限制时间戳。
+        if self._settings.enable_daily_limit:
+            today = datetime.date.today().isoformat()
+            committed = self._usage_data.get(today, {}).get(user_id, 0)
+            pending = self._pending_usage_data.get(today, {}).get(user_id, 0)
+            if committed + pending >= self._settings.daily_limit_count:
+                return f"❌ 您今日的生图额度已用完 ({self._settings.daily_limit_count}次)，请明天再试"
+
+        # 检查频率限制
         if self._settings.rate_limit_seconds > 0:
             now = time.time()
             last_ts = self._user_request_timestamps.get(user_id, 0)
@@ -94,21 +103,51 @@ class UsageManager:
                 return f"❌ 请求过于频繁，请在 {remaining} 秒后再试"
             self._user_request_timestamps[user_id] = now
 
-        # 2. 检查每日限制
+        return True
+
+    def reserve_usage(self, user_id: str) -> bool | str:
+        """预占一次生图额度，防止后台任务并发绕过每日限制。"""
+        check_result = self.check_rate_limit(user_id)
+        if check_result is not True:
+            return check_result
+
         if self._settings.enable_daily_limit:
             today = datetime.date.today().isoformat()
-            if today not in self._usage_data:
-                self._usage_data[today] = {}
-
-            count = self._usage_data[today].get(user_id, 0)
-            if count >= self._settings.daily_limit_count:
-                return f"❌ 您今日的生图额度已用完 ({self._settings.daily_limit_count}次)，请明天再试"
+            if today not in self._pending_usage_data:
+                self._pending_usage_data[today] = {}
+            self._pending_usage_data[today][user_id] = (
+                self._pending_usage_data[today].get(user_id, 0) + 1
+            )
+            logger.debug(f"[ImageGen] 已预占生图额度: user={user_id}")
 
         return True
 
-    def record_usage(self, user_id: str) -> None:
+    def release_usage_reservation(self, user_id: str) -> None:
+        """释放一次未提交的生图额度预占。"""
+        if not self._settings.enable_daily_limit:
+            return
+
+        today = datetime.date.today().isoformat()
+        pending_today = self._pending_usage_data.get(today)
+        if not pending_today:
+            return
+
+        current = pending_today.get(user_id, 0)
+        if current <= 1:
+            pending_today.pop(user_id, None)
+        else:
+            pending_today[user_id] = current - 1
+
+        if not pending_today:
+            self._pending_usage_data.pop(today, None)
+        logger.debug(f"[ImageGen] 已释放生图额度预占: user={user_id}")
+
+    def record_usage(self, user_id: str, *, reserved: bool = False) -> None:
         """记录用户使用次数。"""
         if self._settings.enable_daily_limit:
+            if reserved:
+                self.release_usage_reservation(user_id)
+
             today = datetime.date.today().isoformat()
             if today not in self._usage_data:
                 self._usage_data[today] = {}

@@ -28,8 +28,29 @@ class TaskManager:
         if name:
             task.set_name(name)
         self.background_tasks.add(task)
-        task.add_done_callback(self.background_tasks.discard)
+        task.add_done_callback(
+            functools.partial(self._on_background_task_done, name or task.get_name())
+        )
         return task
+
+    def _log_task_exception(self, task: asyncio.Task, task_name: str) -> None:
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is None:
+            return
+        logger.error(
+            f"[ImageGen] [TaskManager] 后台任务 {task_name} 异常结束: {exc}",
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+
+    def _on_background_task_done(self, task_name: str, task: asyncio.Task) -> None:
+        """后台任务结束时清理集合并记录未捕获异常。"""
+        self.background_tasks.discard(task)
+        self._log_task_exception(task, task_name)
 
     def start_loop_task(
         self,
@@ -90,6 +111,7 @@ class TaskManager:
         """定时任务结束时的回调。"""
         self.background_tasks.discard(task)
         self._loop_tasks.pop(name, None)
+        self._log_task_exception(task, f"loop_{name}")
 
     def register_startup_task(
         self,
@@ -223,6 +245,7 @@ class TaskManager:
         self.background_tasks.discard(task)
         self._daily_tasks.pop(name, None)
         self._last_run_dates.pop(name, None)
+        self._log_task_exception(task, f"daily_{name}")
 
     async def cancel_all(self):
         """取消所有正在运行的任务。"""

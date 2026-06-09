@@ -600,6 +600,8 @@ class ImageGenerationPlugin(Star):
         # 初始化生成器
         self.generator: ImageGenerator | None = None
         self.semaphore: asyncio.Semaphore | None = None
+        self._jimeng_token_adapter: Any | None = None
+        self._handled_command_events: dict[str, float] = {}
 
     # ---------------------- 生命周期 ----------------------
 
@@ -638,9 +640,12 @@ class ImageGenerationPlugin(Star):
     async def terminate(self):
         """插件卸载时调用"""
         try:
+            await self.task_manager.cancel_all()
             if self.generator:
                 await self.generator.close()
-            await self.task_manager.cancel_all()
+            if self._jimeng_token_adapter:
+                await self._jimeng_token_adapter.close()
+                self._jimeng_token_adapter = None
             logger.info("[ImageGen] 插件已卸载")
         except Exception as exc:
             logger.error(f"[ImageGen] 卸载清理出错: {exc}")
@@ -680,22 +685,57 @@ class ImageGenerationPlugin(Star):
             return
 
         # 创建专门用于任务的即梦适配器实例
-        jimeng_adapter = Jimeng2APIAdapter(jimeng_config)
+        self._jimeng_token_adapter = Jimeng2APIAdapter(jimeng_config)
 
         # 1. 注册为启动任务，插件启动时执行一次
         self.task_manager.register_startup_task(
             name="jimeng_token_receive",
-            coro_func=jimeng_adapter.receive_token,
+            coro_func=self._jimeng_token_adapter.receive_token,
         )
 
         # 2. 注册为每日任务，日期变更时执行
         self.task_manager.start_daily_task(
             name="jimeng_token_receive",
-            coro_func=jimeng_adapter.receive_token,
+            coro_func=self._jimeng_token_adapter.receive_token,
             check_interval_seconds=300,  # 每5分钟检查一次日期变更
             run_immediately=False,  # 启动任务已处理，无需重复执行
         )
         logger.info("[ImageGen] 已配置即梦2API自动领积分任务（启动时+每日）")
+
+    def _claim_command_event(self, event: AstrMessageEvent, intent: str) -> bool:
+        """同一条指令只处理一次，避免兜底监听和标准 command 双触发。"""
+        try:
+            if getattr(event, "_imagegen_command_claimed", False):
+                return False
+            setattr(event, "_imagegen_command_claimed", True)
+        except Exception:
+            pass
+
+        now = time.time()
+        expired = [
+            key
+            for key, ts in self._handled_command_events.items()
+            if now - ts > 30
+        ]
+        for key in expired:
+            self._handled_command_events.pop(key, None)
+
+        message_obj = getattr(event, "message_obj", None)
+        message_id = (
+            getattr(message_obj, "message_id", None)
+            or getattr(message_obj, "id", None)
+            or getattr(event, "message_id", None)
+        )
+        event_key = (
+            f"{intent}:{event.unified_msg_origin}:{message_id}"
+            if message_id is not None
+            else f"{intent}:{id(event)}"
+        )
+        if event_key in self._handled_command_events:
+            return False
+
+        self._handled_command_events[event_key] = now
+        return True
 
     def _adjust_tool_parameters(self, tool: ImageGenerationTool) -> None:
         """根据适配器能力动态调整工具参数。"""
@@ -753,58 +793,68 @@ class ImageGenerationPlugin(Star):
         aspect_ratio: str = "1:1",
         resolution: str = "1K",
         task_id: str | None = None,
+        reserved_usage: bool = False,
     ) -> None:
         """异步生成图片并发送。"""
-        if not self.generator or not self.generator.adapter:
-            return
+        reservation_transferred = False
+        try:
+            if not self.generator or not self.generator.adapter:
+                return
 
-        capabilities = self.generator.adapter.get_capabilities()
+            capabilities = self.generator.adapter.get_capabilities()
 
-        # 检查并清理不支持的参数
-        if not (capabilities & ImageCapability.IMAGE_TO_IMAGE) and images_data:
-            logger.warning(
-                f"[ImageGen] 当前适配器不支持参考图，已忽略 {len(images_data)} 张图片"
-            )
-            images_data = None
+            # 检查并清理不支持的参数
+            if not (capabilities & ImageCapability.IMAGE_TO_IMAGE) and images_data:
+                logger.warning(
+                    f"[ImageGen] 当前适配器不支持参考图，已忽略 {len(images_data)} 张图片"
+                )
+                images_data = None
 
-        if not (capabilities & ImageCapability.ASPECT_RATIO) and aspect_ratio != "自动":
-            logger.info(
-                f"[ImageGen] 当前适配器不支持指定比例，已忽略参数: {aspect_ratio}"
-            )
-            aspect_ratio = "自动"
+            if not (capabilities & ImageCapability.ASPECT_RATIO) and aspect_ratio != "自动":
+                logger.info(
+                    f"[ImageGen] 当前适配器不支持指定比例，已忽略参数: {aspect_ratio}"
+                )
+                aspect_ratio = "自动"
 
-        if not (capabilities & ImageCapability.RESOLUTION) and resolution != "1K":
-            logger.info(
-                f"[ImageGen] 当前适配器不支持指定分辨率，已忽略参数: {resolution}"
-            )
-            resolution = "1K"
+            if not (capabilities & ImageCapability.RESOLUTION) and resolution != "1K":
+                logger.info(
+                    f"[ImageGen] 当前适配器不支持指定分辨率，已忽略参数: {resolution}"
+                )
+                resolution = "1K"
 
-        if not task_id:
-            task_id = hashlib.md5(
-                f"{time.time()}{unified_msg_origin}".encode()
-            ).hexdigest()[:8]
+            if not task_id:
+                task_id = hashlib.md5(
+                    f"{time.time()}{unified_msg_origin}".encode()
+                ).hexdigest()[:8]
 
-        final_ar = validate_aspect_ratio(aspect_ratio) or None
-        if final_ar == "自动":
-            final_ar = None
-        final_res = validate_resolution(resolution)
+            final_ar = validate_aspect_ratio(aspect_ratio) or None
+            if final_ar == "自动":
+                final_ar = None
+            final_res = validate_resolution(resolution)
 
-        images: list[ImageData] = []
-        if images_data:
-            for data, mime in images_data:
-                images.append(ImageData(data=data, mime_type=mime))
+            images: list[ImageData] = []
+            if images_data:
+                for data, mime in images_data:
+                    images.append(ImageData(data=data, mime_type=mime))
 
-        # 使用信号量控制并发
-        if self.semaphore is None:
-            await self._do_generate_and_send(
-                prompt, unified_msg_origin, images, final_ar, final_res, task_id
-            )
-            return
+            # 使用信号量控制并发
+            if self.semaphore is None:
+                reservation_transferred = True
+                await self._do_generate_and_send(
+                    prompt, unified_msg_origin, images, final_ar, final_res, task_id,
+                    reserved_usage=reserved_usage,
+                )
+                return
 
-        async with self.semaphore:
-            await self._do_generate_and_send(
-                prompt, unified_msg_origin, images, final_ar, final_res, task_id
-            )
+            async with self.semaphore:
+                reservation_transferred = True
+                await self._do_generate_and_send(
+                    prompt, unified_msg_origin, images, final_ar, final_res, task_id,
+                    reserved_usage=reserved_usage,
+                )
+        finally:
+            if reserved_usage and not reservation_transferred:
+                self.usage_manager.release_usage_reservation(unified_msg_origin)
 
     async def _do_generate_and_send(
         self,
@@ -814,95 +864,106 @@ class ImageGenerationPlugin(Star):
         aspect_ratio: str | None,
         resolution: str | None,
         task_id: str,
+        *,
+        reserved_usage: bool = False,
     ) -> None:
         """执行生成逻辑并发送结果。"""
         start_time = time.time()
-        if not self.generator:
-            logger.warning("[ImageGen] 生成器未初始化，跳过生成请求")
-            return
-        result = await self.generator.generate(
-            GenerationRequest(
+        usage_committed = False
+        try:
+            if not self.generator:
+                logger.warning("[ImageGen] 生成器未初始化，跳过生成请求")
+                return
+            result = await self.generator.generate(
+                GenerationRequest(
+                    prompt=prompt,
+                    images=images,
+                    aspect_ratio=aspect_ratio,
+                    resolution=resolution,
+                    task_id=task_id,
+                )
+            )
+            end_time = time.time()
+            duration = end_time - start_time
+
+            if result.error:
+                # 详细错误仅记录到日志，用户只看到简短友好提示
+                logger.error(
+                    f"[ImageGen] 任务 {task_id} 生成失败，耗时: {duration:.2f}s, 错误: {result.error}"
+                )
+                friendly_msg = _user_friendly_error(result.error)
+                await self.context.send_message(
+                    unified_msg_origin,
+                    MessageChain().message(f"❌ {friendly_msg}"),
+                )
+                return
+
+            logger.info(
+                f"[ImageGen] 任务 {task_id} 生成成功，耗时: {duration:.2f}s, 图片数量: {len(result.images) if result.images else 0}"
+            )
+
+            if not result.images:
+                return
+
+            generated_file_paths: list[str] = []
+            for img_bytes in result.images:
+                file_path = self.image_processor.save_generated_image(task_id, img_bytes)
+                if file_path:
+                    generated_file_paths.append(file_path)
+
+            if not generated_file_paths:
+                logger.warning(f"[ImageGen] 任务 {task_id} 未能保存任何生成图片")
+                return
+
+            # 生图后图片审核
+            image_allowed, image_reason = await self.safety_auditor.audit_generated_images(
                 prompt=prompt,
-                images=images,
-                aspect_ratio=aspect_ratio,
-                resolution=resolution,
-                task_id=task_id,
+                image_paths=generated_file_paths,
+                unified_msg_origin=unified_msg_origin,
             )
-        )
-        end_time = time.time()
-        duration = end_time - start_time
+            if not image_allowed:
+                logger.warning(f"[ImageGen] 任务 {task_id} 图片审核未通过: {image_reason}")
+                await self.context.send_message(
+                    unified_msg_origin,
+                    MessageChain().message(f"❌ 图片内容审核未通过: {image_reason}"),
+                )
+                return
 
-        if result.error:
-            # 详细错误仅记录到日志，用户只看到简短友好提示
-            logger.error(
-                f"[ImageGen] 任务 {task_id} 生成失败，耗时: {duration:.2f}s, 错误: {result.error}"
-            )
-            friendly_msg = _user_friendly_error(result.error)
-            await self.context.send_message(
+            # 记录使用次数
+            self.usage_manager.record_usage(
                 unified_msg_origin,
-                MessageChain().message(f"❌ {friendly_msg}"),
+                reserved=reserved_usage,
             )
-            return
+            usage_committed = True
 
-        logger.info(
-            f"[ImageGen] 任务 {task_id} 生成成功，耗时: {duration:.2f}s, 图片数量: {len(result.images) if result.images else 0}"
-        )
+            chain = MessageChain()
+            for file_path in generated_file_paths:
+                chain.file_image(file_path)
 
-        if not result.images:
-            return
+            info_parts = []
+            if self.config_manager.show_generation_info:
+                info_parts.append(
+                    f"✨ 生成成功！\n📊 耗时: {duration:.2f}s\n🖼️ 数量: {len(generated_file_paths)}张"
+                )
 
-        generated_file_paths: list[str] = []
-        for img_bytes in result.images:
-            file_path = self.image_processor.save_generated_image(task_id, img_bytes)
-            if file_path:
-                generated_file_paths.append(file_path)
+            if self.config_manager.show_model_info and self.config_manager.adapter_config:
+                info_parts.append(
+                    f"🤖 模型: {self.config_manager.adapter_config.name}/{self.config_manager.adapter_config.model}"
+                )
 
-        if not generated_file_paths:
-            logger.warning(f"[ImageGen] 任务 {task_id} 未能保存任何生成图片")
-            return
+            if self.usage_manager.is_daily_limit_enabled():
+                count = self.usage_manager.get_usage_count(unified_msg_origin)
+                info_parts.append(
+                    f"📅 今日用量: {count}/{self.usage_manager.get_daily_limit()}"
+                )
 
-        # 生图后图片审核
-        image_allowed, image_reason = await self.safety_auditor.audit_generated_images(
-            prompt=prompt,
-            image_paths=generated_file_paths,
-            unified_msg_origin=unified_msg_origin,
-        )
-        if not image_allowed:
-            logger.warning(f"[ImageGen] 任务 {task_id} 图片审核未通过: {image_reason}")
-            await self.context.send_message(
-                unified_msg_origin,
-                MessageChain().message(f"❌ 图片内容审核未通过: {image_reason}"),
-            )
-            return
+            if info_parts:
+                chain.message("\n" + "\n".join(info_parts))
 
-        # 记录使用次数
-        self.usage_manager.record_usage(unified_msg_origin)
-
-        chain = MessageChain()
-        for file_path in generated_file_paths:
-            chain.file_image(file_path)
-
-        info_parts = []
-        if self.config_manager.show_generation_info:
-            info_parts.append(
-                f"✨ 生成成功！\n📊 耗时: {duration:.2f}s\n🖼️ 数量: {len(generated_file_paths)}张"
-            )
-
-        if self.config_manager.show_model_info and self.config_manager.adapter_config:
-            info_parts.append(
-                f"🤖 模型: {self.config_manager.adapter_config.name}/{self.config_manager.adapter_config.model}"
-            )
-
-        if self.usage_manager.is_daily_limit_enabled():
-            count = self.usage_manager.get_usage_count(unified_msg_origin)
-            info_parts.append(
-                f"📅 今日用量: {count}/{self.usage_manager.get_daily_limit()}"
-            )
-
-        if info_parts:
-            chain.message("\n" + "\n".join(info_parts))
-
-        await self.context.send_message(unified_msg_origin, chain)
+            await self.context.send_message(unified_msg_origin, chain)
+        finally:
+            if reserved_usage and not usage_committed:
+                self.usage_manager.release_usage_reservation(unified_msg_origin)
 
     # ---------------------- 指令处理 ----------------------
 
@@ -913,16 +974,17 @@ class ImageGenerationPlugin(Star):
         if not text.startswith("/"):
             return None, ""
 
-        for intent, command in (
-            ("model", "生图模型"),
-            ("preset", "预设"),
-            ("generate", "生图"),
+        for intent, commands in (
+            ("model", ("生图模型",)),
+            ("preset", ("预设",)),
+            ("generate", ("生图", "画图", "生成图")),
         ):
-            prefix = f"/{command}"
-            if text == prefix:
-                return intent, ""
-            if text.startswith(prefix) and text[len(prefix)].isspace():
-                return intent, text[len(prefix) :].strip()
+            for command in commands:
+                prefix = f"/{command}"
+                if text == prefix:
+                    return intent, ""
+                if text.startswith(prefix) and text[len(prefix)].isspace():
+                    return intent, text[len(prefix) :].strip()
         return None, ""
 
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -932,6 +994,10 @@ class ImageGenerationPlugin(Star):
         intent, arg = self._detect_intent(raw_text)
         if not intent:
             return
+
+        if not self._claim_command_event(event, intent):
+            return
+        event.stop_event()
 
         logger.info(f"[ImageGen] passive listener matched intent: {intent}")
         if intent == "generate":
@@ -953,11 +1019,11 @@ class ImageGenerationPlugin(Star):
             ):
                 yield result
 
-        event.stop_event()
-
-    @filter.command("生图")
+    @filter.command("生图", alias=["画图", "生成图"])
     async def generate_image_command(self, event: AstrMessageEvent):
         """处理生图指令。"""
+        if not self._claim_command_event(event, "generate"):
+            return
         async for result in self._handle_generate_image(event):
             yield result
 
@@ -969,11 +1035,10 @@ class ImageGenerationPlugin(Star):
         """处理生图逻辑，供标准 command 和被动监听共用。"""
         user_id = event.unified_msg_origin
 
-        # 检查频率限制和每日限制
-        check_result = self.usage_manager.check_rate_limit(user_id)
-        if isinstance(check_result, str):
-            if check_result:
-                yield event.plain_result(check_result)
+        reservation_result = self.usage_manager.reserve_usage(user_id)
+        if reservation_result is not True:
+            if isinstance(reservation_result, str) and reservation_result:
+                yield event.plain_result(reservation_result)
             return
 
         masked_uid = mask_sensitive(user_id)
@@ -984,6 +1049,7 @@ class ImageGenerationPlugin(Star):
         if prompt_text is None:
             cmd_parts = user_input.split(maxsplit=1)
             if not cmd_parts:
+                self.usage_manager.release_usage_reservation(user_id)
                 return
             prompt = cmd_parts[1].strip() if len(cmd_parts) > 1 else ""
         else:
@@ -998,6 +1064,7 @@ class ImageGenerationPlugin(Star):
             resolution,
         )
         if parsed_command.error:
+            self.usage_manager.release_usage_reservation(user_id)
             yield event.plain_result(f"❌ {parsed_command.error}")
             return
 
@@ -1039,6 +1106,7 @@ class ImageGenerationPlugin(Star):
             prompt = extra_content
 
         if not prompt:
+            self.usage_manager.release_usage_reservation(user_id)
             yield event.plain_result("❌ 请提供图片生成的提示词或预设名称！")
             return
 
@@ -1055,6 +1123,7 @@ class ImageGenerationPlugin(Star):
                 f"[诊断] 提示词审核耗时: {prompt_audit_duration:.2f}s"
             )
         if not prompt_allowed:
+            self.usage_manager.release_usage_reservation(user_id)
             yield event.plain_result(f"❌ 提示词审核未通过: {prompt_reason}")
             return
 
@@ -1088,6 +1157,7 @@ class ImageGenerationPlugin(Star):
                     f"[ImageGen] 参考图候选 {fetched_images.candidate_count} 个，"
                     "但全部缓存失败，已取消本次图生图任务"
                 )
+                self.usage_manager.release_usage_reservation(user_id)
                 yield event.plain_result(
                     "❌ 参考图下载失败，已取消生图任务。请重新发送图片后再试。"
                 )
@@ -1127,12 +1197,15 @@ class ImageGenerationPlugin(Star):
                 aspect_ratio=aspect_ratio,
                 resolution=resolution,
                 task_id=task_id,
+                reserved_usage=True,
             )
         )
 
     @filter.command("生图模型")
     async def model_command(self, event: AstrMessageEvent, model_index: str = ""):
         """切换生图模型。"""
+        if not self._claim_command_event(event, "model"):
+            return
         async for result in self._handle_model_command(event, model_index=model_index):
             yield result
 
@@ -1184,6 +1257,8 @@ class ImageGenerationPlugin(Star):
     @filter.command("预设")
     async def preset_command(self, event: AstrMessageEvent):
         """管理生图预设。"""
+        if not self._claim_command_event(event, "preset"):
+            return
         async for result in self._handle_preset_command(event):
             yield result
 

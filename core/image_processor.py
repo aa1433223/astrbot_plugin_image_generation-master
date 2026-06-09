@@ -123,6 +123,41 @@ class ImageProcessor:
             or ""
         ).strip()
 
+    def _get_reply_message_id(self, component: Any) -> str:
+        for attr in ("id", "message_id", "msg_id"):
+            value = getattr(component, attr, None)
+            if value:
+                return str(value).strip()
+        return ""
+
+    async def _call_bot_action(
+        self,
+        event: AstrMessageEvent,
+        action: str,
+        **params: Any,
+    ) -> dict[str, Any] | None:
+        bot = getattr(event, "bot", None)
+        if not bot or not hasattr(bot, "call_action"):
+            return None
+        try:
+            result = await bot.call_action(action=action, **params)
+        except TypeError:
+            try:
+                result = await bot.call_action(action, **params)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"[ImageGen] call_action {action} 失败: params={params}, error={exc}")
+                return None
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[ImageGen] call_action {action} 失败: params={params}, error={exc}")
+            return None
+
+        if not isinstance(result, dict):
+            return None
+        data = result.get("data")
+        if isinstance(data, dict):
+            return data
+        return result
+
     def _delete_source_cache(self, digest: str) -> None:
         """删除同源旧参考图缓存，防止失败下载复用旧文件。"""
         cache_dir = self._cache_path()
@@ -368,28 +403,99 @@ class ImageProcessor:
         event: AstrMessageEvent,
         file_id: str,
     ) -> tuple[str, str] | None:
-        bot = getattr(event, "bot", None)
-        if not bot or not hasattr(bot, "call_action"):
-            return None
-        try:
-            result = await bot.call_action(action="get_image", file=file_id)
-        except TypeError:
-            try:
-                result = await bot.call_action("get_image", file=file_id)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug(f"[ImageGen] get_image 获取原图失败: file={file_id}, error={exc}")
-                return None
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(f"[ImageGen] get_image 获取原图失败: file={file_id}, error={exc}")
+        result = await self._call_bot_action(event, "get_image", file=file_id)
+        if not result:
             return None
 
-        if not isinstance(result, dict):
-            return None
         source = result.get("file") or result.get("path") or result.get("url")
         if not source:
             return None
         source_type = "aiocqhttp_get_image_file" if result.get("file") or result.get("path") else "aiocqhttp_get_image_url"
         return str(source), source_type
+
+    async def _get_quoted_message_segments(
+        self,
+        event: AstrMessageEvent,
+        reply_component: Any,
+    ) -> tuple[list[dict[str, Any]], str]:
+        """通过 QQ/OneBot get_msg 拉取被引用消息的原始消息段。"""
+        message_id = self._get_reply_message_id(reply_component)
+        if not message_id:
+            return [], ""
+
+        action_message_id: int | str = (
+            int(message_id) if message_id.isdigit() else message_id
+        )
+        result = await self._call_bot_action(
+            event,
+            "get_msg",
+            message_id=action_message_id,
+        )
+        if not result:
+            return [], message_id
+
+        segments = result.get("message")
+        if isinstance(segments, str):
+            try:
+                import json
+
+                decoded = json.loads(segments)
+                segments = decoded
+            except Exception:  # noqa: BLE001
+                segments = []
+
+        if not isinstance(segments, list):
+            raw_message = result.get("raw_message")
+            segments = raw_message if isinstance(raw_message, list) else []
+
+        valid_segments = [segment for segment in segments if isinstance(segment, dict)]
+        if valid_segments:
+            logger.info(
+                f"[ImageGen] 已通过 get_msg 获取引用消息: message_id={message_id}, "
+                f"segments={len(valid_segments)}"
+            )
+        return valid_segments, message_id
+
+    async def _iter_raw_image_segment_sources(
+        self,
+        segment: dict[str, Any],
+        event: AstrMessageEvent,
+    ) -> tuple[list[tuple[str, str]], str | None]:
+        if segment.get("type") != "image":
+            return [], None
+
+        data = segment.get("data") or {}
+        if not isinstance(data, dict):
+            return [], None
+
+        candidates: list[tuple[str, str]] = []
+        file_id = data.get("file") or data.get("file_id")
+        path = data.get("path") or data.get("file_path")
+        url = data.get("url")
+
+        if path:
+            candidates.append((str(path), "raw_image_path"))
+        if file_id:
+            original = await self._get_aiocqhttp_original_image_source(
+                event,
+                str(file_id),
+            )
+            if original:
+                candidates.append(original)
+            if self._looks_like_local_source(str(file_id)):
+                candidates.append((str(file_id), "raw_image_file_local"))
+        if url:
+            candidates.append((str(url), "raw_image_url"))
+
+        deduped: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for source, source_type in candidates:
+            if not source or source in seen:
+                continue
+            seen.add(source)
+            deduped.append((source, source_type))
+
+        return deduped, str(file_id) if file_id else None
 
     async def _iter_image_component_sources(
         self,
@@ -594,8 +700,9 @@ class ImageProcessor:
                         )
                 elif self._is_reply_component(component):
                     # 处理引用消息中的图片
-                    if component.chain:
-                        for sub_comp in component.chain:
+                    chain = getattr(component, "chain", None)
+                    if chain:
+                        for sub_comp in chain:
                             if self._is_image_component(sub_comp):
                                 sources = await self._iter_image_component_sources(
                                     sub_comp,
@@ -610,6 +717,22 @@ class ImageProcessor:
                                 source = self._get_file_component_source(sub_comp)
                                 if source:
                                     await remember_file_image(source)
+                    raw_segments, reply_message_id = await self._get_quoted_message_segments(
+                        event,
+                        component,
+                    )
+                    for segment in raw_segments:
+                        sources, file_id = await self._iter_raw_image_segment_sources(
+                            segment,
+                            event,
+                        )
+                        if not sources:
+                            continue
+                        stable_source = file_id or sources[-1][0]
+                        await remember_sources(
+                            sources,
+                            source_key=f"reply:{reply_message_id}:image:{stable_source}",
+                        )
                 elif self._is_file_component(component):
                     source = self._get_file_component_source(component)
                     if source:
