@@ -614,7 +614,7 @@ class ImageProcessor:
             *,
             source_key: str | None = None,
             kind: str = "image",
-        ) -> None:
+        ) -> bool:
             nonlocal candidate_count, failed_count
             candidate_count += 1
             key = source_key or self._source_key(source, kind=kind)
@@ -628,16 +628,18 @@ class ImageProcessor:
             cached = await self.cache_image(source, source_key=key, kind=kind)
             if cached:
                 cached_by_source[key] = cached
+                return True
             else:
                 failed_count += 1
                 cached_by_source[key] = None
+                return False
 
         async def remember_sources(
             sources: list[tuple[str, str]],
             *,
             source_key: str,
             kind: str = "image",
-        ) -> None:
+        ) -> bool:
             nonlocal candidate_count, failed_count
             candidate_count += 1
             key = source_key
@@ -655,15 +657,17 @@ class ImageProcessor:
             )
             if cached:
                 cached_by_source[key] = cached
+                return True
             else:
                 failed_count += 1
                 cached_by_source[key] = None
+                return False
 
-        async def remember_file_image(source: str) -> None:
+        async def remember_file_image(source: str) -> bool:
             nonlocal candidate_count, failed_count
             cached = await self._cache_file_image_if_valid(source)
             if not cached:
-                return
+                return False
             candidate_count += 1
             key = cached.source_key
             if key in cached_by_source:
@@ -673,6 +677,7 @@ class ImageProcessor:
                 )
                 cached_by_source.pop(key, None)
             cached_by_source[key] = cached
+            return True
 
         raw_file_ids = self._extract_raw_image_file_ids(event)
         raw_file_index = 0
@@ -700,6 +705,7 @@ class ImageProcessor:
                         )
                 elif self._is_reply_component(component):
                     # 处理引用消息中的图片
+                    reply_image_cached = False
                     chain = getattr(component, "chain", None)
                     if chain:
                         for sub_comp in chain:
@@ -709,30 +715,36 @@ class ImageProcessor:
                                     event,
                                 )
                                 if sources:
-                                    await remember_sources(
+                                    if await remember_sources(
                                         sources,
                                         source_key=f"image:{sources[-1][0]}",
-                                    )
+                                    ):
+                                        reply_image_cached = True
                             elif self._is_file_component(sub_comp):
                                 source = self._get_file_component_source(sub_comp)
                                 if source:
-                                    await remember_file_image(source)
-                    raw_segments, reply_message_id = await self._get_quoted_message_segments(
-                        event,
-                        component,
-                    )
-                    for segment in raw_segments:
-                        sources, file_id = await self._iter_raw_image_segment_sources(
-                            segment,
+                                    if await remember_file_image(source):
+                                        reply_image_cached = True
+
+                    # OneBot get_msg 只作为兜底：部分 QQ 引用消息没有填充 Reply.chain。
+                    # 如果 chain 中的图片已经成功缓存，再拉原始消息会把同一张图算两次。
+                    if not reply_image_cached:
+                        raw_segments, reply_message_id = await self._get_quoted_message_segments(
                             event,
+                            component,
                         )
-                        if not sources:
-                            continue
-                        stable_source = file_id or sources[-1][0]
-                        await remember_sources(
-                            sources,
-                            source_key=f"reply:{reply_message_id}:image:{stable_source}",
-                        )
+                        for segment in raw_segments:
+                            sources, file_id = await self._iter_raw_image_segment_sources(
+                                segment,
+                                event,
+                            )
+                            if not sources:
+                                continue
+                            stable_source = file_id or sources[-1][0]
+                            await remember_sources(
+                                sources,
+                                source_key=f"reply:{reply_message_id}:image:{stable_source}",
+                            )
                 elif self._is_file_component(component):
                     source = self._get_file_component_source(component)
                     if source:
