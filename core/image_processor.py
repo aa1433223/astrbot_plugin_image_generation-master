@@ -177,6 +177,51 @@ class ImageProcessor:
         if deleted:
             logger.info(f"[ImageGen] 已清理同源旧参考图缓存 {deleted} 个 (source={digest})")
 
+    def _read_cached_image(
+        self,
+        source_key: str,
+        digest: str,
+        source_label: str,
+    ) -> CachedImage | None:
+        """读取同源已有参考图缓存；缓存无效时删除并回退到重新下载。"""
+        cache_dir = self._cache_path()
+        if not cache_dir.exists():
+            return None
+
+        cached_paths = sorted(
+            (path for path in cache_dir.glob(f"ref_{digest}*") if path.is_file()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for path in cached_paths:
+            try:
+                data = path.read_bytes()
+            except OSError as exc:
+                logger.warning(f"[ImageGen] 读取参考图缓存失败: {path} - {exc}")
+                continue
+
+            mime = self._validate_image_bytes(data, source_label)
+            if not mime:
+                try:
+                    path.unlink()
+                    logger.info(f"[ImageGen] 已删除无效参考图缓存: {path}")
+                except OSError as exc:
+                    logger.warning(f"[ImageGen] 删除无效参考图缓存失败: {path} - {exc}")
+                continue
+
+            logger.info(
+                f"[ImageGen] 命中参考图缓存: path={path}, "
+                f"mime={mime}, bytes={len(data)}, source={source_label}"
+            )
+            return CachedImage(
+                data=data,
+                mime_type=mime,
+                cache_path=str(path),
+                source_key=source_key,
+            )
+
+        return None
+
     def _mime_extension(self, mime: str) -> str | None:
         return {
             "image/png": ".png",
@@ -290,9 +335,12 @@ class ImageProcessor:
         digest = self._source_digest(source_key)
         source_label = self._safe_source_label(source_key)
         cache_dir = self._cache_path()
-        tmp_path = cache_dir / f"tmp_ref_{digest}_{uuid.uuid4().hex}.tmp"
 
-        self._delete_source_cache(digest)
+        cached = self._read_cached_image(source_key, digest, source_label)
+        if cached:
+            return cached
+
+        tmp_path = cache_dir / f"tmp_ref_{digest}_{uuid.uuid4().hex}.tmp"
 
         try:
             data = await self._write_source_to_tmp(source, tmp_path)
@@ -309,6 +357,7 @@ class ImageProcessor:
             if not ext:
                 return None
             final_path = cache_dir / f"ref_{digest}{ext}"
+            self._delete_source_cache(digest)
             os.replace(tmp_path, final_path)
             cached_data = final_path.read_bytes()
             cached_mime = self._validate_image_bytes(cached_data, source_label)

@@ -34,7 +34,7 @@ AstrBot 通用图像生成插件，支持文生图、图生图、LLM 工具调�
 
 如果消息、引用消息或 @ 用户里带有图片，且当前适配器支持图生图，插件会自动把图片或头像作为参考图。
 
-参考图会先写入插件本地缓存并重新读回，确认缓存成功后才会启动图生图任务。当前本地签名版的 `metadata.yaml` 插件名是 `noram_image_generation`，所以运行时缓存目录通常是：
+参考图会优先读取插件本地缓存；同一来源已有有效缓存时会直接复用。未命中或缓存校验失败时，会重新写入缓存并读回，确认缓存成功后才会启动图生图任务。当前本地签名版的 `metadata.yaml` 插件名是 `noram_image_generation`，所以运行时缓存目录通常是：
 
 ```text
 AstrBot/data/plugin_data/noram_image_generation/cache
@@ -213,7 +213,7 @@ OpenAI 额外配置：
 - 中转站 60 秒左右 504，但后台实际出图：文生图可确认 `openai.newapi_async=true`；图生图始终走 multipart 同步模式，受 Cloudflare 等 CDN 超时限制（通常 120s），如果中转站处理时间超过 CDN 超时会返回 524 错误。
 - 报 `invalid_reference_image` / 参考图解析失败：检查上传图片是否超过 `max_image_size_mb`、是否能被 PIL 解析；OpenAI/NewAPI 路径会自动转为 PNG/JPEG，multipart 字段应为重复 `image` 而不是 `image[]`。
 - 参考图看起来像压缩图：插件会优先使用 `path`、本地 `file`、NapCat/aiocqhttp `get_image(file=...)` 返回的本地文件；如果只能使用消息段 URL，日志会提示 `component_url_fallback`，这取决于平台是否提供原图。
-- 找不到参考图缓存或怀疑用了旧图：看插件加载日志里的实际 `cache_dir`。每张参考图都会先写入 `ref_*.tmp`，校验成功后原子替换成最终 `ref_*.png/.jpg/.gif/.webp/.heic/.heif`；同来源旧缓存会在下载前删除，下载失败不会复用旧缓存。
+- 找不到参考图缓存或怀疑用了旧图：看插件加载日志里的实际 `cache_dir`。每张参考图会按来源生成稳定缓存键，命中有效的 `ref_*.png/.jpg/.gif/.webp/.heic/.heif` 时直接读取；未命中或缓存校验失败时才写入 `ref_*.tmp`，校验成功后原子替换为最终缓存文件。
 - 报 `Invalid size '16:9'`：说明没有走 `resolution/aspect_ratio -> WIDTHxHEIGHT` 映射，检查当前模型是否使用 `openai` 适配器。
 - 图片生成成功但回收慢：尝试开启 `prefer_url_response`，并配置 `proxy`。
 - 报 `Cannot connect to host ... ssl` / `SSL handshake`：说明请求还没到中转站。配置了 `proxy` 时会自动直连重试一次；trace 里应看到 `proxy_connect_failed` 和 `proxy_fallback_direct_success`。如果部署环境必须强制走代理，可以关闭 `proxy_fallback_direct`。
